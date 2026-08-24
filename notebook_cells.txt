@@ -1,0 +1,269 @@
+=== CELL 1 ===
+pip install torch torchvision torchaudio pandas numpy scikit-learn tqdm
+=== CELL 2 ===
+!pip install torchcodec soundfile
+=== CELL 3 ===
+train_df = pd.read_csv("/kaggle/input/competitions/digitrecognition-ee708/train.csv")
+train_df.head()
+=== CELL 4 ===
+import os
+import torch
+import torchaudio.transforms as T
+from torch.utils.data import Dataset
+import soundfile as sf  # Importing soundfile to bypass torchaudio backend issues
+
+class DigitAudioDataset(Dataset):
+    def __init__(self, df, data_dir, is_train=True):
+        self.df = df
+        self.data_dir = data_dir
+        self.is_train = is_train
+        
+        # Audio Feature Extraction
+        self.mel_spectrogram = T.MelSpectrogram(
+            sample_rate=SAMPLE_RATE,
+            n_fft=1024,
+            hop_length=256,
+            n_mels=N_MELS
+        )
+        self.amplitude_to_db = T.AmplitudeToDB()
+        
+        # SpecAugment (Only applied during training)
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=15)
+        self.time_mask = T.TimeMasking(time_mask_param=35)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        file_path = os.path.join(self.data_dir, f"{row['id']}.wav")
+        
+        # --- THE FIX: Load audio using soundfile instead of torchaudio ---
+        audio_array, sr = sf.read(file_path)
+        
+        # Convert numpy array to PyTorch tensor [channels, time]
+        if audio_array.ndim == 1:
+            waveform = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0)
+        else:
+            # If stereo, transpose to [channels, time] and mean to mono
+            waveform = torch.tensor(audio_array, dtype=torch.float32).t()
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        # -----------------------------------------------------------------
+            
+        # Resample if necessary
+        if sr != SAMPLE_RATE:
+            resampler = T.Resample(sr, SAMPLE_RATE)
+            waveform = resampler(waveform)
+            
+        # Pad or Truncate to MAX_LENGTH
+        if waveform.shape[1] > MAX_LENGTH:
+            waveform = waveform[:, :MAX_LENGTH]
+        elif waveform.shape[1] < MAX_LENGTH:
+            padding = MAX_LENGTH - waveform.shape[1]
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+            
+        # Extract Mel Spectrogram
+        mel_spec = self.mel_spectrogram(waveform)
+        mel_spec = self.amplitude_to_db(mel_spec)
+        
+        # Apply Data Augmentation
+        if self.is_train:
+            mel_spec = self.freq_mask(mel_spec)
+            mel_spec = self.time_mask(mel_spec)
+            
+        # Normalize the spectrogram
+        mel_spec = (mel_spec - mel_spec.mean()) / (mel_spec.std() + 1e-6)
+        
+        if 'label' in row:
+            return mel_spec, torch.tensor(row['label'], dtype=torch.long)
+        else:
+            return mel_spec, row['id']
+=== CELL 5 ===
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torchaudio
+import torchaudio.transforms as T
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
+from sklearn.model_selection import train_test_split
+from tqdm.notebook import tqdm
+
+# Hyperparameters
+BATCH_SIZE = 64
+EPOCHS = 40
+LEARNING_RATE = 1e-3
+SAMPLE_RATE = 16000     # Target sample rate
+MAX_LENGTH = 16000      # 1 second of audio
+N_MELS = 64             # Number of Mel bands
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Using device: {DEVICE}")
+=== CELL 6 ===
+def get_model():
+    # Load ResNet18 architecture with NO PRETRAINED WEIGHTS
+    model = models.resnet18(weights=None)
+    
+    # Modify the first layer to accept 1 channel instead of 3
+    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+    
+    # Modify the final classification layer for 10 digits (0-9)
+    num_ftrs = model.fc.in_features
+    model.fc = nn.Linear(num_ftrs, 10)
+    
+    return model.to(DEVICE)
+
+model = get_model()
+=== CELL 7 ===
+import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
+
+# 1. Define absolute paths based on your specific folder structure
+BASE_DIR = "/kaggle/input/competitions/digitrecognition-ee708"
+TRAIN_CSV_PATH = os.path.join(BASE_DIR, "train.csv")
+
+# Using the nested audio path you provided
+TRAIN_AUDIO_DIR = TRAIN_AUDIO_DIR = os.path.join(BASE_DIR, "train_audio", "train_audio")
+
+# 2. Load dataframe using the absolute path
+train_df = pd.read_csv(TRAIN_CSV_PATH)
+
+# 3. Stratified split to ensure balanced classes in validation
+train_data, val_data = train_test_split(train_df, test_size=0.15, stratify=train_df['label'], random_state=42)
+
+# 4. Create datasets (pass TRAIN_AUDIO_DIR instead of the relative 'train_audio' string)
+train_dataset = DigitAudioDataset(train_data, TRAIN_AUDIO_DIR, is_train=True)
+val_dataset = DigitAudioDataset(val_data, TRAIN_AUDIO_DIR, is_train=False)
+
+# 5. Create loaders
+# Note: If you encounter an "A device attached to the system is not functioning" error 
+# or similar multiprocessing errors on Windows, change num_workers=0
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+=== CELL 8 ===
+import torch.optim as optim
+from tqdm.notebook import tqdm
+import torch.nn as nn
+import torch
+
+# Define Loss function, Optimizer, and Learning Rate Scheduler
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+
+best_val_acc = 0.0
+
+for epoch in range(EPOCHS):
+    # --- Training Phase ---
+    model.train()
+    train_loss = 0.0
+    train_correct = 0
+    
+    # Use tqdm for a nice progress bar in Jupyter
+    for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]"):
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item() * inputs.size(0)
+        _, preds = torch.max(outputs, 1)
+        train_correct += torch.sum(preds == labels.data)
+        
+    train_acc = train_correct.double() / len(train_dataset)
+    
+    # --- Validation Phase ---
+    model.eval()
+    val_loss = 0.0
+    val_correct = 0
+    
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            
+            val_loss += loss.item() * inputs.size(0)
+            _, preds = torch.max(outputs, 1)
+            val_correct += torch.sum(preds == labels.data)
+            
+    val_acc = val_correct.double() / len(val_dataset)
+    scheduler.step() # Update learning rate
+    
+    print(f"Epoch {epoch+1} | Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}")
+    
+    # Save the weights only when the model improves
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        torch.save(model.state_dict(), 'best_digit_model.pth')
+        print("--> Saved new best model!")
+=== CELL 10 ===
+import os
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+from tqdm.notebook import tqdm
+
+# 1. Define paths for testing using your absolute paths
+BASE_DIR = "/kaggle/input/competitions/digitrecognition-ee708"
+
+# Handle the potential nested folder structure for test_audio
+TEST_AUDIO_DIR = os.path.join(BASE_DIR, "test_audio", "test_audio")
+if not os.path.exists(TEST_AUDIO_DIR):
+    TEST_AUDIO_DIR = os.path.join(BASE_DIR, "test_audio")
+
+print(f"Loading test audio from: {TEST_AUDIO_DIR}")
+
+# 2. Create a test dataframe directly from the folder contents
+test_files = [f.split('.')[0] for f in os.listdir(TEST_AUDIO_DIR) if f.endswith('.wav')]
+test_df = pd.DataFrame({'id': test_files})
+
+# 3. Create Test Dataset and Loader 
+# is_train=False ensures no SpecAugment is applied to the test data
+# num_workers=0 prevents the Windows multiprocessing freeze
+test_dataset = DigitAudioDataset(test_df, TEST_AUDIO_DIR, is_train=False)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+# 4. Load the best weights saved during training
+model.load_state_dict(torch.load('best_digit_model.pth'))
+model.eval()
+
+predictions = []
+ids = []
+
+print("Generating predictions on the test set...")
+with torch.no_grad():
+    for inputs, batch_ids in tqdm(test_loader, desc="Testing"):
+        inputs = inputs.to(DEVICE)
+        outputs = model(inputs)
+        
+        # Get the index of the max log-probability
+        _, preds = torch.max(outputs, 1)
+        
+        predictions.extend(preds.cpu().numpy())
+        ids.extend(batch_ids)
+
+# 5. Create the final submission file
+submission = pd.DataFrame({
+    'id': ids,
+    'label': predictions
+})
+
+# Sort the submission to ensure it aligns perfectly with Kaggle's expectations
+submission = submission.sort_values(by='id').reset_index(drop=True)
+
+submission_path = "/kaggle/working/submission.csv"
+
+submission.to_csv(submission_path, index=False)
+
+print(f"Success! Your submission file is saved at: {submission_path}")
+=== CELL 11 ===
+
